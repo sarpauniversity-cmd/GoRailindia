@@ -1,4 +1,16 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import {
+  collection,
+  addDoc,
+  updateDoc,
+  query,
+  where,
+  getDocs,
+  doc,
+  onSnapshot,
+  Unsubscribe,
+} from 'firebase/firestore';
+import { db } from '../firebase/config';
 import { Train } from '../data/trains';
 
 export interface Passenger {
@@ -29,11 +41,14 @@ export interface Booking {
 
 interface BookingContextType {
   bookings: Booking[];
-  addBooking: (booking: Omit<Booking, 'id' | 'pnr' | 'bookedAt'>) => Booking;
-  cancelBooking: (pnr: string) => void;
+  loading: boolean;
+  addBooking: (booking: Omit<Booking, 'id' | 'pnr' | 'bookedAt'>) => Promise<Booking>;
+  cancelBooking: (pnr: string) => Promise<void>;
   getBookingByPnr: (pnr: string) => Booking | undefined;
   getUserBookings: (userId: string) => Booking[];
   getAllBookings: () => Booking[];
+  fetchAllBookings: () => Promise<Booking[]>;
+  loadUserBookings: (userId: string) => void;
   currentBooking: {
     train: Train | null;
     journeyDate: string;
@@ -50,7 +65,7 @@ interface BookingContextType {
 
 const BookingContext = createContext<BookingContextType | undefined>(undefined);
 
-const BOOKINGS_KEY = 'railbook_bookings';
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 const generatePNR = (): string => {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -64,8 +79,7 @@ const generatePNR = (): string => {
 const getSeatRecommendation = (passenger: Passenger): { seatNumber: string; berthType: string } => {
   const seatNum = Math.floor(Math.random() * 72) + 1;
   let berthType = 'Middle';
-  
-  // Smart seat allocation
+
   if (passenger.age > 60) {
     berthType = 'Lower';
   } else if (passenger.gender === 'female') {
@@ -76,15 +90,18 @@ const getSeatRecommendation = (passenger: Passenger): { seatNumber: string; bert
     const berths = ['Lower', 'Middle', 'Upper', 'Side Lower', 'Side Upper'];
     berthType = berths[Math.floor(Math.random() * berths.length)];
   }
-  
+
   return {
     seatNumber: `${String.fromCharCode(65 + Math.floor(seatNum / 10))}${seatNum % 10 || 10}`,
-    berthType
+    berthType,
   };
 };
 
+// ── Provider ──────────────────────────────────────────────────────────────────
+
 export const BookingProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [bookings, setBookings] = useState<Booking[]>([]);
+  const [loading, setLoading] = useState(false);
   const [currentBooking, setCurrentBooking] = useState<{
     train: Train | null;
     journeyDate: string;
@@ -94,68 +111,116 @@ export const BookingProvider: React.FC<{ children: ReactNode }> = ({ children })
     train: null,
     journeyDate: '',
     travelClass: '',
-    passengers: []
+    passengers: [],
   });
 
-  useEffect(() => {
-    const stored = localStorage.getItem(BOOKINGS_KEY);
-    if (stored) {
-      setBookings(JSON.parse(stored));
+  // Real-time listener ref so we can unsubscribe when userId changes
+  const unsubscribeRef = React.useRef<Unsubscribe | null>(null);
+
+  // Subscribe to a user's bookings in real-time from Firestore
+  const loadUserBookings = (userId: string) => {
+    // Unsubscribe previous listener if any
+    if (unsubscribeRef.current) {
+      unsubscribeRef.current();
     }
+
+    const q = query(collection(db, 'bookings'), where('userId', '==', userId));
+    const unsub = onSnapshot(q, (snapshot) => {
+      const fetched: Booking[] = snapshot.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<Booking, 'id'>),
+      }));
+      setBookings(fetched);
+    });
+
+    unsubscribeRef.current = unsub;
+  };
+
+  // Cleanup listener on unmount
+  useEffect(() => {
+    return () => {
+      if (unsubscribeRef.current) unsubscribeRef.current();
+    };
   }, []);
 
-  const saveBookings = (newBookings: Booking[]) => {
-    localStorage.setItem(BOOKINGS_KEY, JSON.stringify(newBookings));
-    setBookings(newBookings);
-  };
-
-  const addBooking = (bookingData: Omit<Booking, 'id' | 'pnr' | 'bookedAt'>): Booking => {
-    const passengersWithSeats = bookingData.passengers.map(p => ({
+  // Add a new booking to Firestore
+  const addBooking = async (bookingData: Omit<Booking, 'id' | 'pnr' | 'bookedAt'>): Promise<Booking> => {
+    const passengersWithSeats = bookingData.passengers.map((p) => ({
       ...p,
-      ...getSeatRecommendation(p)
+      ...getSeatRecommendation(p),
     }));
-    
-    const newBooking: Booking = {
+
+    const newBooking: Omit<Booking, 'id'> = {
       ...bookingData,
       passengers: passengersWithSeats,
-      id: `BK${Date.now()}`,
       pnr: generatePNR(),
-      bookedAt: new Date().toISOString()
+      bookedAt: new Date().toISOString(),
     };
-    
-    const updated = [...bookings, newBooking];
-    saveBookings(updated);
-    return newBooking;
+
+    const docRef = await addDoc(collection(db, 'bookings'), newBooking);
+
+    const savedBooking: Booking = { id: docRef.id, ...newBooking };
+
+    // Optimistically update local state (real-time listener will also fire)
+    setBookings((prev) => [...prev, savedBooking]);
+
+    return savedBooking;
   };
 
-  const cancelBooking = (pnr: string) => {
-    const updated = bookings.map(b => 
-      b.pnr === pnr ? { ...b, status: 'cancelled' as const } : b
+  // Cancel a booking by PNR — updates Firestore doc
+  const cancelBooking = async (pnr: string) => {
+    // Find the booking doc in local state to get its Firestore id
+    const booking = bookings.find((b) => b.pnr === pnr);
+    if (!booking) return;
+
+    const bookingRef = doc(db, 'bookings', booking.id);
+    await updateDoc(bookingRef, { status: 'cancelled' });
+
+    // Optimistic local update (real-time listener will also fire)
+    setBookings((prev) =>
+      prev.map((b) => (b.pnr === pnr ? { ...b, status: 'cancelled' } : b))
     );
-    saveBookings(updated);
   };
 
-  const getBookingByPnr = (pnr: string) => {
-    return bookings.find(b => b.pnr === pnr);
+  // Fetch ALL bookings from Firestore (admin use)
+  const fetchAllBookings = async (): Promise<Booking[]> => {
+    setLoading(true);
+    try {
+      const snapshot = await getDocs(collection(db, 'bookings'));
+      const all: Booking[] = snapshot.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<Booking, 'id'>),
+      }));
+      setBookings(all);
+      return all;
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const getUserBookings = (userId: string) => {
-    return bookings.filter(b => b.userId === userId);
-  };
+  // Synchronous helpers that work on already-loaded bookings in state
+  const getBookingByPnr = (pnr: string) => bookings.find((b) => b.pnr === pnr);
+
+  const getUserBookings = (userId: string) => bookings.filter((b) => b.userId === userId);
 
   const getAllBookings = () => bookings;
 
   return (
-    <BookingContext.Provider value={{
-      bookings,
-      addBooking,
-      cancelBooking,
-      getBookingByPnr,
-      getUserBookings,
-      getAllBookings,
-      currentBooking,
-      setCurrentBooking
-    }}>
+    <BookingContext.Provider
+      value={{
+        bookings,
+        loading,
+        addBooking,
+        cancelBooking,
+        getBookingByPnr,
+        getUserBookings,
+        getAllBookings,
+        fetchAllBookings,
+        loadUserBookings,
+        currentBooking,
+        setCurrentBooking,
+      }}
+    >
       {children}
     </BookingContext.Provider>
   );
