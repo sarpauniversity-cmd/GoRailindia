@@ -1,4 +1,16 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import {
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  sendPasswordResetEmail,
+  onAuthStateChanged,
+  updateProfile,
+  FirebaseError,
+} from 'firebase/auth';
+import { doc, setDoc, getDoc } from 'firebase/firestore';
+import { auth, db, googleProvider } from '../firebase/config';
 
 interface User {
   uid: string;
@@ -20,162 +32,151 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-// Demo users storage (simulating Firebase)
-const DEMO_USERS_KEY = 'gorail_users';
-const CURRENT_USER_KEY = 'gorail_current_user';
-
-const getDemoUsers = (): Record<string, User & { password: string }> => {
-  const stored = localStorage.getItem(DEMO_USERS_KEY);
-  if (stored) return JSON.parse(stored);
-  
-  // Initialize with admin and demo users
-  const defaultUsers = {
-    'admin@gorail.com': {
-      uid: 'admin-001',
-      email: 'admin@gorail.com',
-      displayName: 'Admin User',
-      password: 'admin123',
-      isAdmin: true
-    },
-    'user@gorail.com': {
-      uid: 'user-001',
-      email: 'user@gorail.com',
-      displayName: 'Demo User',
-      password: 'user123',
-      isAdmin: false
-    }
-  };
-  localStorage.setItem(DEMO_USERS_KEY, JSON.stringify(defaultUsers));
-  return defaultUsers;
+// Helper: save user profile to Firestore
+const saveUserToFirestore = async (uid: string, data: Partial<User>) => {
+  const userRef = doc(db, 'users', uid);
+  await setDoc(userRef, data, { merge: true });
 };
 
-const saveDemoUsers = (users: Record<string, User & { password: string }>) => {
-  localStorage.setItem(DEMO_USERS_KEY, JSON.stringify(users));
+// Helper: fetch user profile from Firestore (to get isAdmin etc.)
+const getUserFromFirestore = async (uid: string): Promise<Partial<User>> => {
+  const userRef = doc(db, 'users', uid);
+  const snap = await getDoc(userRef);
+  return snap.exists() ? (snap.data() as Partial<User>) : {};
 };
 
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Listen to Firebase Auth state changes
   useEffect(() => {
-    // Check for stored user on mount
-    const storedUser = localStorage.getItem(CURRENT_USER_KEY);
-    if (storedUser) {
-      setUser(JSON.parse(storedUser));
-    }
-    setLoading(false);
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        // Fetch extra fields (isAdmin) from Firestore
+        const firestoreData = await getUserFromFirestore(firebaseUser.uid);
+        setUser({
+          uid: firebaseUser.uid,
+          email: firebaseUser.email ?? '',
+          displayName: firebaseUser.displayName ?? firestoreData.displayName ?? '',
+          photoURL: firebaseUser.photoURL ?? undefined,
+          isAdmin: firestoreData.isAdmin ?? false,
+        });
+      } else {
+        setUser(null);
+      }
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
   }, []);
 
+  // Email/password login
   const login = async (email: string, password: string) => {
-    const users = getDemoUsers();
-    const userRecord = users[email.toLowerCase()];
-    
-    if (!userRecord || userRecord.password !== password) {
-      throw new Error('Invalid email or password');
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      // onAuthStateChanged will update the user state automatically
+    } catch (error) {
+      if (error instanceof FirebaseError) {
+        if (
+          error.code === 'auth/user-not-found' ||
+          error.code === 'auth/wrong-password' ||
+          error.code === 'auth/invalid-credential'
+        ) {
+          throw new Error('Invalid email or password');
+        }
+        throw new Error(error.message);
+      }
+      throw error;
     }
-    
-    const loggedInUser: User = {
-      uid: userRecord.uid,
-      email: userRecord.email,
-      displayName: userRecord.displayName,
-      isAdmin: userRecord.isAdmin
-    };
-    
-    setUser(loggedInUser);
-    localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(loggedInUser));
   };
 
+  // Google sign-in
   const loginWithGoogle = async () => {
-    // Simulate Google OAuth login for demo purposes
-    // In production, this would use Firebase's signInWithPopup(auth, googleProvider)
-    
-    // Generate a random Google user for demo
-    const googleUsers = [
-      { name: 'John Doe', email: 'john.doe@gmail.com' },
-      { name: 'Jane Smith', email: 'jane.smith@gmail.com' },
-      { name: 'Alex Johnson', email: 'alex.johnson@gmail.com' },
-      { name: 'Sarah Williams', email: 'sarah.williams@gmail.com' },
-      { name: 'Michael Brown', email: 'michael.brown@gmail.com' }
-    ];
-    
-    const randomUser = googleUsers[Math.floor(Math.random() * googleUsers.length)];
-    
-    // Simulate network delay
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    const users = getDemoUsers();
-    
-    // Check if user already exists
-    if (!users[randomUser.email.toLowerCase()]) {
-      // Create new user from Google
-      const newUser = {
-        uid: `google-${Date.now()}`,
-        email: randomUser.email.toLowerCase(),
-        displayName: randomUser.name,
-        password: '', // Google users don't have password
-        photoURL: `https://ui-avatars.com/api/?name=${encodeURIComponent(randomUser.name)}&background=2563EB&color=fff`,
-        isAdmin: false
-      };
-      
-      users[randomUser.email.toLowerCase()] = newUser;
-      saveDemoUsers(users);
+    try {
+      const result = await signInWithPopup(auth, googleProvider);
+      const firebaseUser = result.user;
+
+      // Save to Firestore on first Google login
+      const firestoreData = await getUserFromFirestore(firebaseUser.uid);
+      if (!firestoreData.uid) {
+        await saveUserToFirestore(firebaseUser.uid, {
+          uid: firebaseUser.uid,
+          email: firebaseUser.email ?? '',
+          displayName: firebaseUser.displayName ?? '',
+          photoURL: firebaseUser.photoURL ?? undefined,
+          isAdmin: false,
+        });
+      }
+      // onAuthStateChanged handles state update
+    } catch (error) {
+      if (error instanceof FirebaseError) {
+        if (error.code === 'auth/popup-closed-by-user') {
+          throw new Error('Sign-in popup was closed. Please try again.');
+        }
+        throw new Error(error.message);
+      }
+      throw error;
     }
-    
-    const userRecord = users[randomUser.email.toLowerCase()];
-    
-    const loggedInUser: User = {
-      uid: userRecord.uid,
-      email: userRecord.email,
-      displayName: userRecord.displayName,
-      photoURL: `https://ui-avatars.com/api/?name=${encodeURIComponent(userRecord.displayName)}&background=2563EB&color=fff`,
-      isAdmin: userRecord.isAdmin
-    };
-    
-    setUser(loggedInUser);
-    localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(loggedInUser));
   };
 
+  // Email/password registration
   const register = async (email: string, password: string, name: string) => {
-    const users = getDemoUsers();
-    
-    if (users[email.toLowerCase()]) {
-      throw new Error('Email already registered');
+    try {
+      const result = await createUserWithEmailAndPassword(auth, email, password);
+      const firebaseUser = result.user;
+
+      // Set displayName on Firebase Auth profile
+      await updateProfile(firebaseUser, { displayName: name });
+
+      // Save user doc to Firestore
+      await saveUserToFirestore(firebaseUser.uid, {
+        uid: firebaseUser.uid,
+        email: firebaseUser.email ?? '',
+        displayName: name,
+        isAdmin: false,
+      });
+
+      // onAuthStateChanged will update state, but displayName may lag — update manually
+      setUser({
+        uid: firebaseUser.uid,
+        email: firebaseUser.email ?? '',
+        displayName: name,
+        isAdmin: false,
+      });
+    } catch (error) {
+      if (error instanceof FirebaseError) {
+        if (error.code === 'auth/email-already-in-use') {
+          throw new Error('Email already registered');
+        }
+        if (error.code === 'auth/weak-password') {
+          throw new Error('Password should be at least 6 characters');
+        }
+        throw new Error(error.message);
+      }
+      throw error;
     }
-    
-    const newUser = {
-      uid: `user-${Date.now()}`,
-      email: email.toLowerCase(),
-      displayName: name,
-      password,
-      isAdmin: false
-    };
-    
-    users[email.toLowerCase()] = newUser;
-    saveDemoUsers(users);
-    
-    const loggedInUser: User = {
-      uid: newUser.uid,
-      email: newUser.email,
-      displayName: newUser.displayName,
-      isAdmin: false
-    };
-    
-    setUser(loggedInUser);
-    localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(loggedInUser));
   };
 
+  // Logout
   const logout = async () => {
-    setUser(null);
-    localStorage.removeItem(CURRENT_USER_KEY);
+    await signOut(auth);
+    // onAuthStateChanged will set user to null
   };
 
+  // Password reset email
   const resetPassword = async (email: string) => {
-    const users = getDemoUsers();
-    if (!users[email.toLowerCase()]) {
-      throw new Error('No account found with this email');
+    try {
+      await sendPasswordResetEmail(auth, email);
+    } catch (error) {
+      if (error instanceof FirebaseError) {
+        if (error.code === 'auth/user-not-found') {
+          throw new Error('No account found with this email');
+        }
+        throw new Error(error.message);
+      }
+      throw error;
     }
-    // In demo mode, just show success
-    console.log('Password reset email sent to:', email);
   };
 
   return (
